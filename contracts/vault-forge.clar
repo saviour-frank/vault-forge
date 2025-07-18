@@ -306,3 +306,119 @@
             total-owed
             repay-amount
           ))
+          (remaining-loan (if is-full-repayment
+            u0
+            (- loan-amount
+              (if (>= actual-repayment interest)
+                (- actual-repayment interest)
+                u0
+              ))
+          ))
+          (remaining-interest (if is-full-repayment
+            u0
+            (if (>= actual-repayment interest)
+              u0
+              (- interest actual-repayment)
+            )
+          ))
+        )
+        ;; Verify borrower authorization
+        (asserts! (is-eq tx-sender borrower) ERR-NOT-AUTHORIZED)
+        ;; Process repayment transfer
+        (try! (stx-transfer? actual-repayment tx-sender (as-contract tx-sender)))
+        (if is-full-repayment
+          (begin
+            ;; Complete loan closure
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: u0,
+                interest-accumulated: u0,
+                status: "repaid",
+              })
+            )
+            ;; Release collateral to borrower
+            (map-set user-deposits borrower
+              (+ (get-user-deposit borrower) collateral)
+            )
+            ;; Update protocol metrics
+            (var-set total-borrowed (- (var-get total-borrowed) loan-amount))
+          )
+          (begin
+            ;; Partial repayment processing
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: remaining-loan,
+                interest-accumulated: remaining-interest,
+              })
+            )
+            ;; Update protocol metrics
+            (var-set total-borrowed
+              (- (var-get total-borrowed) (- loan-amount remaining-loan))
+            )
+          )
+        )
+        (ok actual-repayment)
+      )
+      ERR-LOAN-NOT-FOUND
+    )
+  )
+)
+
+;; LIQUIDATION ENGINE
+
+(define-public (liquidate (loan-id uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    ;; Validate loan existence
+    (asserts! (<= loan-id (var-get loan-nonce)) ERR-INVALID-LOAN-ID)
+    (asserts! (is-some (get-loan-details loan-id)) ERR-LOAN-NOT-FOUND)
+    ;; Sync interest calculations
+    (try! (update-loan-interest loan-id))
+    ;; Verify liquidation eligibility
+    (asserts! (is-liquidatable loan-id) ERR-LOAN-NOT-LIQUIDATABLE)
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (borrower (get borrower loan-data))
+          (loan-amount (get loan-amount loan-data))
+          (interest (get interest-accumulated loan-data))
+          (collateral (get collateral-amount loan-data))
+          (total-debt (+ loan-amount interest))
+          (liquidation-bonus (/ (* collateral u5) u100))
+          (collateral-for-liquidator (- collateral liquidation-bonus))
+          (protocol-fee-from-liquidation (/ (* liquidation-bonus u50) u100))
+          (liquidator-bonus (- liquidation-bonus protocol-fee-from-liquidation))
+          (current-height (get-current-stacks-block-height))
+        )
+        ;; Liquidator debt settlement
+        (try! (stx-transfer? total-debt tx-sender (as-contract tx-sender)))
+        ;; Transfer collateral to liquidator
+        (map-set user-deposits tx-sender
+          (+ (get-user-deposit tx-sender) collateral-for-liquidator)
+        )
+        ;; Liquidator bonus allocation
+        (map-set user-deposits tx-sender
+          (+ (get-user-deposit tx-sender) liquidator-bonus)
+        )
+        ;; Protocol fee collection
+        (map-set protocol-fees current-height
+          (+ (default-to u0 (map-get? protocol-fees current-height))
+            protocol-fee-from-liquidation
+          ))
+        ;; Mark loan as liquidated
+        (map-set loans { loan-id: loan-id }
+          (merge loan-data {
+            loan-amount: u0,
+            interest-accumulated: u0,
+            collateral-amount: u0,
+            status: "liquidated",
+          })
+        )
+        ;; Update protocol metrics
+        (var-set total-borrowed (- (var-get total-borrowed) loan-amount))
+        (var-set total-collateral (- (var-get total-collateral) collateral))
+        (ok true)
+      )
+      ERR-LOAN-NOT-FOUND
+    )
+  )
+)
