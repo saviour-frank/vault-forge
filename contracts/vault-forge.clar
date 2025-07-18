@@ -422,3 +422,92 @@
     )
   )
 )
+
+;; PROTOCOL TREASURY MANAGEMENT
+
+(define-public (withdraw-protocol-fees (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (let (
+        (current-height (get-current-stacks-block-height))
+        (available-fees (default-to u0 (map-get? protocol-fees current-height)))
+      )
+      (asserts! (>= available-fees amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Transfer fees to protocol owner
+      (try! (as-contract (stx-transfer? amount (as-contract tx-sender) CONTRACT-OWNER)))
+      ;; Update protocol fee ledger
+      (map-set protocol-fees current-height (- available-fees amount))
+      (ok amount)
+    )
+  )
+)
+
+;; ANALYTICS & REPORTING
+
+(define-read-only (get-user-loan-ids (user principal))
+  (get-user-loans user)
+)
+
+(define-read-only (get-user-active-loans (user principal))
+  (let (
+      (loan-ids (get-user-loans user))
+      (active-loans (filter is-loan-active loan-ids))
+    )
+    active-loans
+  )
+)
+
+(define-private (is-loan-active (loan-id uint))
+  (match (get-loan-details loan-id)
+    loan-data (is-eq (get status loan-data) "active")
+    false
+  )
+)
+
+(define-read-only (get-loan-health (loan-id uint))
+  (if (or (> loan-id (var-get loan-nonce)) (is-none (get-loan-details loan-id)))
+    (err ERR-LOAN-NOT-FOUND)
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (updated-interest (+ (get interest-accumulated loan-data)
+            (calculate-interest (get loan-amount loan-data)
+              (- (get-current-stacks-block-height)
+                (get last-interest-height loan-data)
+              ))
+          ))
+          (collateral-ratio (calculate-collateral-ratio (get collateral-amount loan-data)
+            (get loan-amount loan-data) updated-interest
+          ))
+        )
+        (ok {
+          collateral-ratio: collateral-ratio,
+          liquidation-threshold: (* LIQUIDATION-THRESHOLD u10),
+          is-healthy: (>= collateral-ratio (* LIQUIDATION-THRESHOLD u10)),
+        })
+      )
+      (err ERR-LOAN-NOT-FOUND)
+    )
+  )
+)
+
+(define-read-only (get-market-info)
+  {
+    collateral-ratio-required: COLLATERAL-RATIO,
+    liquidation-threshold: LIQUIDATION-THRESHOLD,
+    yearly-interest-rate: INTEREST-RATE-YEARLY,
+    protocol-fee: PROTOCOL-FEE-PERCENT,
+  }
+)
+
+;; PROTOCOL INITIALIZATION
+
+(begin
+  ;; Initialize protocol state variables
+  (var-set loan-nonce u0)
+  (var-set total-collateral u0)
+  (var-set total-borrowed u0)
+  (var-set paused false)
+  ;; Initialize protocol fee tracking
+  (map-set protocol-fees (get-current-stacks-block-height) u0)
+)
